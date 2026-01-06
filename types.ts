@@ -1,4 +1,5 @@
-export type AssetType = 'FIXED' | 'FII' | 'STOCK';
+// FIX: Add 'REIT' to AssetType to support US Real Estate Investment Trusts.
+export type AssetType = 'FIXED' | 'FII' | 'STOCK' | 'REIT';
 
 export interface Asset {
   id: string;
@@ -11,6 +12,7 @@ export interface Asset {
   dividendYield: number; // Monthly average percentage
   description: string;
   minLevel: number;
+  currency?: 'BRL' | 'USD';
 }
 
 export interface PortfolioItem {
@@ -23,10 +25,10 @@ export interface Career {
   id: string;
   title: string;
   salary: number;
-  baseCostOfLiving: number; // Renomeado para base
+  baseCostOfLiving: number; 
   requiredExperience: number; // 0 to 100
-  requiredCourseId?: string; // Curso específico necessário
-  nextLevelOptions?: string[]; // IDs das próximas carreiras (Ramificação)
+  requiredCourseId?: string; 
+  nextLevelOptions?: string[]; 
 }
 
 export interface EducationCourse {
@@ -38,7 +40,7 @@ export interface EducationCourse {
 }
 
 export interface SideJob {
-  id: string;
+  id:string;
   title: string;
   minGain: number;
   maxGain: number;
@@ -65,12 +67,22 @@ export interface ActiveEffect {
   value: number; 
 }
 
+export type EconomicCycle = 'EXPANSION' | 'NORMAL' | 'RECESSION' | 'CRISIS';
+
+export interface Goal {
+    id: string;
+    name: string;
+    cost: number;
+    description: string;
+    icon: string; // Lucide icon name
+}
+
 export interface GameState {
   cash: number;
   month: number;
   careerId: string;
   experience: number; // Progresso (0-100)
-  completedCourses: string[]; // IDs dos cursos comprados
+  completedCourses: string[]; 
   lifestyle: LifestyleType;
   portfolio: PortfolioItem[];
   history: { month: number; netWorth: number; passiveIncome: number }[];
@@ -78,7 +90,12 @@ export interface GameState {
   unlockedLevels: number[];
   marketPrices: Record<string, number>; 
   activeEffects: ActiveEffect[];
-  sideJobUsage: number; // Contador de usos de renda extra no mês atual
+  sideJobUsage: number;
+  economicCycle: EconomicCycle;
+  selicRate: number; // e.g., 0.115 for 11.5%
+  usdToBrlRate: number;
+  goals: string[]; // IDs of purchased goals
+  favorites: string[]; // IDs of favorited assets
 }
 
 export interface GameEvent {

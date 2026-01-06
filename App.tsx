@@ -26,7 +26,9 @@ import {
   Activity,
   User,
   ShieldAlert,
-  Wallet
+  Wallet,
+  LogOut,
+  Loader2
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -37,10 +39,16 @@ import {
   Tooltip, 
   ResponsiveContainer 
 } from 'recharts';
+import { User as FirebaseUser, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { auth, db } from './firebaseConfig';
 
-import { ASSETS, CAREERS, COURSES, SIDE_JOBS, INITIAL_CASH, LEVELS } from './constants';
+
+// FIX: Import new constants required for economic simulation.
+import { ASSETS, CAREERS, COURSES, SIDE_JOBS, INITIAL_CASH, LEVELS, INITIAL_SELIC_RATE, INITIAL_USD_BRL_RATE } from './constants';
 import { GameState, PortfolioItem, Asset, Career, LogEntry, ActiveEffect, GameEvent, SideJob, EducationCourse, LifestyleType } from './types';
-import { calculateNetWorth, simulateMarket, calculateDividends, formatBRL, generateRandomEvent } from './utils/gameLogic';
+// FIX: Import new game logic functions for economic simulation.
+import { calculateNetWorth, simulateMarket, calculateDividends, formatBRL, generateRandomEvent, updateEconomicCycle, simulateSelic, simulateUsdToBrl } from './utils/gameLogic';
 
 // --- SUB-COMPONENTS ---
 
@@ -73,24 +81,7 @@ const StatCard = ({ title, value, subValue, icon: Icon, color = "emerald" }: any
 
 // --- INITIALIZATION ---
 
-const getInitialState = (): GameState => {
-  const saved = localStorage.getItem('rumo_financeiro_save');
-  if (saved) {
-    const parsed = JSON.parse(saved);
-    // Migrations e Defaults
-    if (!parsed.activeEffects) parsed.activeEffects = [];
-    if (parsed.educationProgress !== undefined && parsed.experience === undefined) {
-       parsed.experience = parsed.educationProgress;
-       delete parsed.educationProgress;
-    }
-    if (!parsed.lifestyle) parsed.lifestyle = 'NORMAL';
-    if (!parsed.completedCourses) parsed.completedCourses = [];
-    if (parsed.sideJobUsage === undefined) parsed.sideJobUsage = 0;
-    
-    return parsed;
-  }
-  
-  // Default State
+const getNewGameState = (): GameState => {
   const initialPrices: Record<string, number> = {};
   ASSETS.forEach(a => initialPrices[a.id] = a.price);
 
@@ -107,25 +98,71 @@ const getInitialState = (): GameState => {
     unlockedLevels: [1],
     marketPrices: initialPrices,
     activeEffects: [],
-    sideJobUsage: 0
+    sideJobUsage: 0,
+    economicCycle: 'NORMAL',
+    selicRate: INITIAL_SELIC_RATE,
+    usdToBrlRate: INITIAL_USD_BRL_RATE,
+    goals: [],
+    favorites: [],
   };
 };
 
 export default function App() {
-  const [gameState, setGameState] = useState<GameState>(getInitialState);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [gameState, setGameState] = useState<GameState>(getNewGameState());
   const [activeTab, setActiveTab] = useState<'home' | 'market' | 'portfolio' | 'career'>('home');
-  const [showDisclaimer, setShowDisclaimer] = useState(true);
+  const [showDisclaimer, setShowDisclaimer] = useState(!localStorage.getItem('disclaimer_seen'));
   const [activeEvent, setActiveEvent] = useState<GameEvent | null>(null);
   const [justLeveledUp, setJustLeveledUp] = useState(false);
 
-  // Persistence
+  // Auth Listener
   useEffect(() => {
-    localStorage.setItem('rumo_financeiro_save', JSON.stringify(gameState));
-  }, [gameState]);
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setIsLoading(true);
+      if (currentUser) {
+        setUser(currentUser);
+        const gameDocRef = doc(db, "userSaves", currentUser.uid);
+        const gameDocSnap = await getDoc(gameDocRef);
+        if (gameDocSnap.exists()) {
+          const savedData = gameDocSnap.data() as GameState;
+          setGameState(savedData);
+        } else {
+          setGameState(getNewGameState());
+        }
+      } else {
+        setUser(null);
+        setGameState(getNewGameState());
+      }
+      setIsLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore Persistence
+  useEffect(() => {
+    if (isLoading || !user) return;
+    
+    const saveGame = async () => {
+      setIsSaving(true);
+      try {
+        await setDoc(doc(db, "userSaves", user.uid), gameState);
+      } catch (error) {
+        console.error("Error saving game state:", error);
+      } finally {
+        setIsSaving(false);
+      }
+    };
+    
+    const debounceSave = setTimeout(saveGame, 1000); // Debounce saves
+    return () => clearTimeout(debounceSave);
+    
+  }, [gameState, user, isLoading]);
 
   // Derived Values
   const currentCareer = CAREERS.find(c => c.id === gameState.careerId) || CAREERS[0];
-  const netWorth = calculateNetWorth(gameState.cash, gameState.portfolio, gameState.marketPrices);
+  const netWorth = calculateNetWorth(gameState.cash, gameState.portfolio, gameState.marketPrices, gameState.usdToBrlRate);
   const currentLevel = Math.max(...gameState.unlockedLevels);
 
   // --- ACTIONS ---
@@ -151,8 +188,6 @@ export default function App() {
       return;
     }
 
-    // Lógica de XP Variável (Tendendo a menor)
-    // Base 2% + Bônus (0 a 18%). Math.random() * Math.random() cria uma curva onde valores baixos são mais comuns.
     const baseGain = 2;
     const maxBonus = 18;
     const variableBonus = Math.floor(maxBonus * (Math.random() * Math.random())); 
@@ -180,8 +215,6 @@ export default function App() {
   };
 
   const handleDoSideJob = (job: SideJob) => {
-    // Cálculo de Risco Progressivo (Fadiga)
-    // Risco Base + 15% por cada uso no mês, teto de 99%
     const riskIncreasePerUse = 0.15;
     const currentRisk = Math.min(0.99, job.risk + (gameState.sideJobUsage * riskIncreasePerUse));
     
@@ -198,7 +231,6 @@ export default function App() {
                 logs: [{ month: prev.month, message: `[FADIGA] ${job.riskMessage} (Risco era ${(currentRisk*100).toFixed(0)}%)`, type: 'event-bad', amount: -job.penalty } as LogEntry, ...prev.logs]
             };
         } else {
-            // Sucesso
             const income = Math.floor(Math.random() * (job.maxGain - job.minGain + 1)) + job.minGain;
             return {
                 ...prev,
@@ -217,7 +249,7 @@ export default function App() {
     setGameState(prev => ({
         ...prev,
         careerId: nextCareerId,
-        experience: 0, // Reset XP para novo cargo
+        experience: 0, 
         logs: [{ month: prev.month, message: `PROMOVIDO! Agora você é ${nextCareer.title}`, type: 'event-good' } as LogEntry, ...prev.logs]
     }));
   };
@@ -330,6 +362,10 @@ export default function App() {
         .map(e => ({ ...e, duration: e.duration - 1 }))
         .filter(e => e.duration > 0);
 
+      const newEconomicCycle = updateEconomicCycle(prev.economicCycle, newMonth);
+      const newSelicRate = simulateSelic(prev.selicRate, newEconomicCycle);
+      const newUsdToBrlRate = simulateUsdToBrl(prev.usdToBrlRate, newEconomicCycle);
+
       const randomEvent = generateRandomEvent(currentCareer.salary);
       let eventCashModifier = 0;
       let salaryMultiplier = 1;
@@ -360,7 +396,7 @@ export default function App() {
       const finalExpenses = baseExpenses * lifestyleMult * inflationMult * randomVariation;
       const finalSalary = currentCareer.salary * salaryMultiplier;
 
-      let newPrices = simulateMarket(prev.marketPrices);
+      let newPrices = simulateMarket(prev.marketPrices, newSelicRate, prev.selicRate, newEconomicCycle);
 
       if (marketModifiers) {
         Object.keys(newPrices).forEach(assetId => {
@@ -371,10 +407,10 @@ export default function App() {
         });
       }
 
-      const { total: dividends, logs: dividendLogs } = calculateDividends(prev.portfolio, newPrices);
+      const { total: dividends, logs: dividendLogs } = calculateDividends(prev.portfolio, newPrices, newUsdToBrlRate);
 
       const newCash = prev.cash + finalSalary - finalExpenses + dividends + eventCashModifier;
-      const newNetWorth = calculateNetWorth(newCash, prev.portfolio, newPrices);
+      const newNetWorth = calculateNetWorth(newCash, prev.portfolio, newPrices, newUsdToBrlRate);
       const newLevels = checkLevelUnlocks(newNetWorth, prev.unlockedLevels);
 
       if (newLevels.length > prev.unlockedLevels.length) {
@@ -400,10 +436,18 @@ export default function App() {
         unlockedLevels: newLevels,
         history: newHistory,
         activeEffects: nextActiveEffects,
-        sideJobUsage: 0
+        sideJobUsage: 0,
+        economicCycle: newEconomicCycle,
+        selicRate: newSelicRate,
+        usdToBrlRate: newUsdToBrlRate,
       };
     });
   };
+  
+  const handleDisclaimer = () => {
+      localStorage.setItem('disclaimer_seen', 'true');
+      setShowDisclaimer(false);
+  }
 
   // --- VIEWS ---
 
@@ -514,7 +558,7 @@ export default function App() {
   const MarketView = () => {
     const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
-    const [filterType, setFilterType] = useState<'ALL' | 'FIXED' | 'FII' | 'STOCK'>('ALL');
+    const [filterType, setFilterType] = useState<'ALL' | 'FIXED' | 'FII' | 'STOCK_BR' | 'STOCK_US'>('ALL');
     const [searchQuery, setSearchQuery] = useState('');
     const [transactionQty, setTransactionQty] = useState(1);
     const [stepMultiplier, setStepMultiplier] = useState(1);
@@ -535,7 +579,11 @@ export default function App() {
     const toggleModal = () => setIsModalOpen(!isModalOpen);
 
     const filteredAssets = ASSETS.filter(asset => {
-      if (filterType !== 'ALL' && asset.type !== filterType) return false;
+      if (filterType === 'FIXED' && asset.type !== 'FIXED') return false;
+      if (filterType === 'FII' && asset.type !== 'FII') return false;
+      if (filterType === 'STOCK_BR' && (asset.type !== 'STOCK' || asset.currency === 'USD')) return false;
+      if (filterType === 'STOCK_US' && (asset.type !== 'STOCK' || asset.currency !== 'USD')) return false;
+
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
         return asset.symbol.toLowerCase().includes(q) || asset.name.toLowerCase().includes(q) || (asset.sector && asset.sector.toLowerCase().includes(q));
@@ -713,7 +761,8 @@ export default function App() {
                     { id: 'ALL', label: 'Todos' },
                     { id: 'FIXED', label: 'Renda Fixa' },
                     { id: 'FII', label: 'FIIs' },
-                    { id: 'STOCK', label: 'Ações' },
+                    { id: 'STOCK_BR', label: 'Ações BR' },
+                    { id: 'STOCK_US', label: 'Ações Exterior (EUA)'},
                   ].map(f => (
                     <button
                       key={f.id}
@@ -1096,78 +1145,9 @@ export default function App() {
       </div>
     );
   };
-
-  // --- MAIN LAYOUT ---
-
-  return (
-    <div className="min-h-screen bg-slate-50 pb-20">
-      
-      {/* Disclaimer Modal */}
-      {showDisclaimer && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black bg-opacity-75 p-4 backdrop-blur-sm">
-          <div className="bg-white rounded-xl max-w-lg w-full p-6 shadow-2xl animate-fade-in-up">
-            <div className="flex items-center text-amber-600 mb-4">
-              <AlertTriangle className="h-8 w-8 mr-3" />
-              <h2 className="text-2xl font-bold">Aviso Legal</h2>
-            </div>
-            <p className="text-gray-700 mb-6">
-              Este é um <strong>SIMULADOR EDUCATIVO</strong>. 
-              <br/><br/>
-              Os valores, ativos e rentabilidades apresentados são fictícios e simplificados para fins de jogo (gamificação). 
-              <strong>Isto não é uma recomendação de investimento real.</strong>
-            </p>
-            <button 
-              onClick={() => setShowDisclaimer(false)}
-              className="w-full bg-slate-900 text-white py-3 rounded font-bold hover:bg-slate-800 transition-colors"
-            >
-              Entendido, vamos jogar!
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Random Event Popup */}
-      {activeEvent && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md">
-           <div className={`
-              relative w-full max-w-md bg-white rounded-2xl shadow-2xl overflow-hidden animate-bounce-in
-              ${activeEvent.type === 'BAD' ? 'border-4 border-red-400' : activeEvent.type === 'GOOD' ? 'border-4 border-emerald-400' : 'border-4 border-blue-400'}
-           `}>
-              <div className={`p-6 text-center ${activeEvent.type === 'BAD' ? 'bg-red-50' : activeEvent.type === 'GOOD' ? 'bg-emerald-50' : 'bg-blue-50'}`}>
-                 <div className="flex justify-center mb-4">
-                    {activeEvent.type === 'BAD' && <ThumbsDown className="w-16 h-16 text-red-500" />}
-                    {activeEvent.type === 'GOOD' && <ThumbsUp className="w-16 h-16 text-emerald-500" />}
-                    {activeEvent.type === 'INFO' && <Info className="w-16 h-16 text-blue-500" />}
-                 </div>
-                 <h2 className={`text-2xl font-black uppercase mb-2 ${activeEvent.type === 'BAD' ? 'text-red-800' : activeEvent.type === 'GOOD' ? 'text-emerald-800' : 'text-blue-800'}`}>
-                   {activeEvent.title}
-                 </h2>
-              </div>
-              
-              <div className="p-6">
-                 <p className="text-gray-700 text-lg text-center font-medium mb-6 leading-relaxed">
-                   {activeEvent.message}
-                 </p>
-                 
-                 {activeEvent.immediateCost && activeEvent.immediateCost !== 0 && (
-                   <div className={`text-center mb-6 py-2 px-4 rounded-lg font-bold text-xl ${activeEvent.immediateCost > 0 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
-                      {activeEvent.immediateCost > 0 ? '+' : ''}{formatBRL(activeEvent.immediateCost)}
-                   </div>
-                 )}
-
-                 <button 
-                   onClick={() => setActiveEvent(null)}
-                   className={`w-full py-4 rounded-xl font-bold text-white text-lg shadow-lg hover:shadow-xl transition-all active:scale-95
-                    ${activeEvent.type === 'BAD' ? 'bg-red-600 hover:bg-red-700' : activeEvent.type === 'GOOD' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-blue-600 hover:bg-blue-700'}
-                   `}
-                 >
-                   CONTINUAR
-                 </button>
-              </div>
-           </div>
-        </div>
-      )}
-
+  
+  const GameView = () => (
+      <>
       {/* Header */}
       <header className="bg-slate-900 text-white shadow-lg sticky top-0 z-30">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -1178,11 +1158,19 @@ export default function App() {
           </div>
           
           <div className="flex items-center gap-4">
-            <div className="hidden sm:flex flex-col items-end mr-4">
-              <span className="text-xs text-slate-400">Saldo em Conta</span>
-              <span className="font-mono font-bold text-emerald-400">{formatBRL(gameState.cash)}</span>
-            </div>
-            
+             {user && (
+                <div className="flex items-center gap-3">
+                    <div className="text-right hidden sm:block">
+                        <div className="text-sm font-bold">{user.displayName}</div>
+                        <div className="text-xs text-slate-400">{user.email}</div>
+                    </div>
+                    <img src={user.photoURL || undefined} alt="User" className="w-8 h-8 rounded-full" />
+                    <button onClick={() => signOut(auth)} className="p-2 rounded-full hover:bg-slate-700 transition-colors">
+                        <LogOut className="w-4 h-4" />
+                    </button>
+                </div>
+             )}
+            <div className="h-8 w-px bg-slate-700"></div>
             <button 
               onClick={handleWork}
               className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-md font-bold flex items-center gap-2 transition-colors shadow-emerald-900/50 shadow-lg"
@@ -1240,6 +1228,123 @@ export default function App() {
            <span className="font-bold">{gameState.month}</span>
         </div>
       </div>
+      </>
+  );
+
+  const LoginView = () => {
+    const signInWithGoogle = async () => {
+        const provider = new GoogleAuthProvider();
+        try {
+            await signInWithPopup(auth, provider);
+        } catch (error) {
+            console.error("Authentication error:", error);
+        }
+    };
+    
+    return (
+        <div className="flex flex-col items-center justify-center min-h-screen bg-slate-100">
+           <div className="text-center p-8 bg-white rounded-2xl shadow-xl max-w-md w-full">
+                <div className="flex justify-center items-center gap-3 mb-2">
+                    <TrendingUp className="h-10 w-10 text-emerald-500" />
+                    <h1 className="text-3xl font-bold text-slate-800">Rumo à Liberdade Financeira</h1>
+                </div>
+                <p className="text-slate-500 mb-8">
+                    Seu simulador de investimentos na bolsa brasileira.
+                </p>
+                <button
+                    onClick={signInWithGoogle}
+                    className="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-lg flex items-center justify-center gap-3 transition-colors"
+                >
+                    <svg className="w-5 h-5" role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><title>Google</title><path fill="white" d="M12.48 10.92v3.28h7.84c-.24 1.84-.85 3.18-1.73 4.1-1.02 1.02-2.3 1.84-4.32 1.84-3.6 0-6.5-2.95-6.5-6.5s2.9-6.5 6.5-6.5c1.95 0 3.35.73 4.13 1.5l2.6-2.6C16.84 3.3 14.9 2.5 12.48 2.5c-5.48 0-9.92 4.45-9.92 9.92s4.44 9.92 9.92 9.92c5.22 0 9.5-4.32 9.5-9.92 0-.73-.08-1.35-.2-1.92z"/></svg>
+                    Entrar com Google
+                </button>
+           </div>
+        </div>
+    );
+  };
+  
+  const LoadingView = () => (
+      <div className="flex items-center justify-center min-h-screen">
+          <Loader2 className="w-12 h-12 text-slate-500 animate-spin" />
+      </div>
+  );
+
+  // --- MAIN LAYOUT ---
+  if (isLoading) {
+      return <LoadingView />;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 pb-20">
+      
+      {/* Disclaimer Modal */}
+      {showDisclaimer && user && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black bg-opacity-75 p-4 backdrop-blur-sm">
+          <div className="bg-white rounded-xl max-w-lg w-full p-6 shadow-2xl animate-fade-in-up">
+            <div className="flex items-center text-amber-600 mb-4">
+              <AlertTriangle className="h-8 w-8 mr-3" />
+              <h2 className="text-2xl font-bold">Aviso Legal</h2>
+            </div>
+            <p className="text-gray-700 mb-6">
+              Este é um <strong>SIMULADOR EDUCATIVO</strong>. 
+              <br/><br/>
+              Os valores, ativos e rentabilidades apresentados são fictícios e simplificados para fins de jogo (gamificação). 
+              <strong>Isto não é uma recomendação de investimento real.</strong>
+            </p>
+            <button 
+              onClick={handleDisclaimer}
+              className="w-full bg-slate-900 text-white py-3 rounded font-bold hover:bg-slate-800 transition-colors"
+            >
+              Entendido, vamos jogar!
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Random Event Popup */}
+      {activeEvent && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/80 backdrop-blur-md">
+           <div className={`
+              relative w-full max-w-md bg-white rounded-2xl shadow-2xl overflow-hidden animate-bounce-in
+              ${activeEvent.type === 'BAD' ? 'border-4 border-red-400' : activeEvent.type === 'GOOD' ? 'border-4 border-emerald-400' : 'border-4 border-blue-400'}
+           `}>
+              <div className={`p-6 text-center ${activeEvent.type === 'BAD' ? 'bg-red-50' : activeEvent.type === 'GOOD' ? 'bg-emerald-50' : 'bg-blue-50'}`}>
+                 <div className="flex justify-center mb-4">
+                    {activeEvent.type === 'BAD' && <ThumbsDown className="w-16 h-16 text-red-500" />}
+                    {activeEvent.type === 'GOOD' && <ThumbsUp className="w-16 h-16 text-emerald-500" />}
+                    {activeEvent.type === 'INFO' && <Info className="w-16 h-16 text-blue-500" />}
+                 </div>
+                 <h2 className={`text-2xl font-black uppercase mb-2 ${activeEvent.type === 'BAD' ? 'text-red-800' : activeEvent.type === 'GOOD' ? 'text-emerald-800' : 'text-blue-800'}`}>
+                   {activeEvent.title}
+                 </h2>
+              </div>
+              
+              <div className="p-6">
+                 <p className="text-gray-700 text-lg text-center font-medium mb-6 leading-relaxed">
+                   {activeEvent.message}
+                 </p>
+                 
+                 {activeEvent.immediateCost && activeEvent.immediateCost !== 0 && (
+                   <div className={`text-center mb-6 py-2 px-4 rounded-lg font-bold text-xl ${activeEvent.immediateCost > 0 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                      {activeEvent.immediateCost > 0 ? '+' : ''}{formatBRL(activeEvent.immediateCost)}
+                   </div>
+                 )}
+
+                 <button 
+                   onClick={() => setActiveEvent(null)}
+                   className={`w-full py-4 rounded-xl font-bold text-white text-lg shadow-lg hover:shadow-xl transition-all active:scale-95
+                    ${activeEvent.type === 'BAD' ? 'bg-red-600 hover:bg-red-700' : activeEvent.type === 'GOOD' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-blue-600 hover:bg-blue-700'}
+                   `}
+                 >
+                   CONTINUAR
+                 </button>
+              </div>
+           </div>
+        </div>
+      )}
+      
+      {user ? <GameView /> : <LoginView />}
+      
     </div>
   );
 }
